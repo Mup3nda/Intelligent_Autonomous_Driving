@@ -1,0 +1,63 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Large model files
+*.pt
+*.pth
+*.weights
+
+# Large data files
+*.csv
+*.png
+*.mp4
+*.avi
+*.mov
+/Rectified Images
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+https://github.com/Mup3nda/Intelligent_Autonomous_Driving.git

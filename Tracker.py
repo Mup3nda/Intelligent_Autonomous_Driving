@@ -1,0 +1,580 @@
+import numpy as np
+import math
+from collections import deque
+
+class SimpleTracker3D:
+    def __init__(self, K,
+                 max_disappeared=15,
+                 max_distance_3d=1.0,    # meters
+                 max_distance_2d=20.0,   # pixels (fallback)
+                 history_len=10):
+        """
+        K: 3x3 camera intrinsics for projection.
+        """
+        self.tracks = {}        # id -> track dict
+        self.next_id = 0
+        self.trajectories = {}  # track_id -> list of 3D points
+
+        self.max_disappeared = max_disappeared
+        self.max_distance_3d = max_distance_3d
+        self.max_distance_2d = max_distance_2d
+        self.history_len = history_len
+
+        self.fx = K[0, 0]; self.fy = K[1, 1]
+        self.cx = K[0, 2]; self.cy = K[1, 2]
+        # --- new: velocity limits & hallucination params ---
+        self.max_speed_2d = 30.0     # px/frame (tweak)
+        self.max_speed_3d = 3.0      # m/frame  (tweak)
+        self.min_speed_for_valid = 0.05  # m/frame *and* px/frame
+        self.hallucinated_frac = 0.3     # 0.3 * max_disappeared
+    # ---------- helpers ----------
+    def _clamp_vec(self, v, max_norm):
+        n = float(np.linalg.norm(v))
+        if n > max_norm and n > 1e-6:
+            v = v * (max_norm / n)
+        return v
+    def _bbox_centroid(self, bbox):
+        x1, y1, x2, y2 = bbox
+        return 0.5 * (x1 + x2), 0.5 * (y1 + y2)
+    def _update_vel2d_from_history(self, track):
+        hist2d = track.get('history2d', None)
+        if hist2d is None or len(hist2d) < 2:
+            return track.get('vel2d', np.zeros(2, dtype=np.float32))
+
+        (x_prev, y_prev) = hist2d[-2]
+        (x_curr, y_curr) = hist2d[-1]
+        v_inst = np.array([x_curr - x_prev, y_curr - y_prev], dtype=np.float32)
+
+        v_old = track.get('vel2d', np.zeros(2, dtype=np.float32))
+        gamma = 0.7  # smooth
+        v = gamma * v_old + (1.0 - gamma) * v_inst
+
+        # clamp
+        v = self._clamp_vec(v, self.max_speed_2d)
+        return v
+    def _update_vel3d_from_history(self, track):
+        hist = track['history3d']
+        if len(hist) < 2:
+            return track['vel3d']
+
+        # use last two points instead of full history
+        p_prev = hist[-2]
+        p_curr = hist[-1]
+        dt = 1.0  # 1 frame; or store timestamps if needed
+
+        v_inst = (p_curr - p_prev) / dt
+
+        # optionally smooth with previous velocity
+        v_old = track.get('vel3d', np.zeros(3, dtype=np.float32))
+        gamma = 0.7  # 70% old, 30% new
+        v = gamma * v_old + (1 - gamma) * v_inst
+        # clamp
+        v = self._clamp_vec(v, self.max_speed_3d)
+        return v
+    def _backproject_uvd(self, u, v, depth):
+        """Backproject pixel (u,v) with depth into camera coords."""
+        X = (u - self.cx) * depth / self.fx
+        Y = (v - self.cy) * depth / self.fy
+        return np.array([X, Y, depth], dtype=np.float32)
+    def _project_3d(self, pos3d):
+        """
+        Project 3D point (camera coords) to image pixel coords.
+        Returns np.array([u, v]) or None if invalid.
+        """
+        X, Y, Z = pos3d
+        if not np.isfinite(Z) or Z <= 0:
+            return None
+        u = self.fx * X / Z + self.cx
+        v = self.fy * Y / Z + self.cy
+        if not np.isfinite(u) or not np.isfinite(v):
+            return None
+        return np.array([u, v], dtype=np.float32)
+    def _is_near_edge(self, point, frame_shape, margin=40):
+        if frame_shape is None:
+            return False
+        H, W = frame_shape
+        x, y = point
+        return (x < margin or x > W - margin or
+                y < margin or y > H - margin)
+    def _cleanup_duplicate_tracks(self, iou_threshold=0.7, motion_threshold=0.5):
+        """
+        Remove duplicate tracks that overlap heavily and aren't moving.
+
+        iou_threshold:     how similar bboxes must be (0.0–1.0)
+        motion_threshold:  max allowed speed (px/frame AND m/frame)
+        """
+        tids = list(self.tracks.keys())
+        to_delete = set()
+
+        def iou(b1, b2):
+            x1,y1,x2,y2 = b1
+            x1b,y1b,x2b,y2b = b2
+            inter_x1 = max(x1, x1b)
+            inter_y1 = max(y1, y1b)
+            inter_x2 = min(x2, x2b)
+            inter_y2 = min(y2, y2b)
+            if inter_x2 <= inter_x1 or inter_y2 <= inter_y1:
+                return 0.0
+
+            inter_area = (inter_x2 - inter_x1) * (inter_y2 - inter_y1)
+            area1 = (x2 - x1) * (y2 - y1)
+            area2 = (x2b - x1b) * (y2b - y1b)
+            return inter_area / float(area1 + area2 - inter_area)
+
+        for i in range(len(tids)):
+            if tids[i] in to_delete: continue
+            trA = self.tracks[tids[i]]
+
+            for j in range(i+1, len(tids)):
+                if tids[j] in to_delete: continue
+                trB = self.tracks[tids[j]]
+
+                # same class?
+                if trA['class_id'] != trB['class_id']:
+                    continue
+
+                # bounding box overlap?
+                ov = iou(trA['bbox'], trB['bbox'])
+                if ov < iou_threshold:
+                    continue
+
+                # both barely moving?
+                v2A = np.linalg.norm(trA.get('vel2d', np.zeros(2)))
+                v2B = np.linalg.norm(trB.get('vel2d', np.zeros(2)))
+                v3A = np.linalg.norm(trA.get('vel3d', np.zeros(3)))
+                v3B = np.linalg.norm(trB.get('vel3d', np.zeros(3)))
+
+                if (v2A < motion_threshold and v2B < motion_threshold and
+                    v3A < motion_threshold and v3B < motion_threshold):
+
+                    # delete whichever one is the *newer* track
+                    older = tids[i]
+                    newer = tids[j]
+                    # keep oldest, delete youngest
+                    to_delete.add(newer)
+
+        for tid in to_delete:
+            if tid in self.tracks:
+                del self.tracks[tid]
+    def _is_likely_hallucination(self, tr):
+        """
+        Decide if a track is probably a spurious detection that we
+        can safely delete early.
+
+        Heuristic:
+        - young track (age < max_disappeared)
+        - has been occluded for most of its life
+        - has very few visible frames
+        - basically not moving in 2D and 3D
+        """
+        age = tr.get('age', 0)
+        if age <= 0:
+            return False
+
+        disappeared = tr.get('disappeared', 0)
+        visible = tr.get('visible_count', 0)
+        v3 = tr.get('vel3d', np.zeros(3, dtype=np.float32))
+        v2 = tr.get('vel2d', np.zeros(2, dtype=np.float32))
+
+        # fraction of life spent occluded
+        frac_occluded = disappeared / float(age)
+
+        # only kill *young* tracks
+        if age >= self.max_disappeared:
+            return False
+
+        # must be occluded most of their life
+        if frac_occluded < 0.6:       # e.g. >60% of life occluded
+            return False
+
+        # must have been barely visible
+        if visible > 2:               # seen clearly more than a couple frames -> keep
+            return False
+
+        # must be almost not moving
+        if (np.linalg.norm(v3) >= self.min_speed_for_valid or
+            np.linalg.norm(v2) >= self.min_speed_for_valid):
+            return False
+
+        return True
+    # ---------- main update ----------
+
+    def update(self, detections, frame_shape=None):
+        """
+        detections: list of (bbox, class_id, confidence, pos3d, feat)
+        pos3d: np.array([X,Y,Z]) in meters, or None if depth invalid.
+        """
+        self.frame_shape = frame_shape
+        # increment age for all existing tracks
+        for tr in self.tracks.values():
+            tr['age'] = tr.get('age', 0) + 1
+
+        # 1) No existing tracks -> start one per detection
+        if len(self.tracks) == 0:
+            for bbox, cls, conf, pos3d, feat in detections:
+                if pos3d is None:
+                    pos3d = np.array([np.nan, np.nan, np.nan], dtype=np.float32)
+
+                tid = self.next_id
+                cx, cy = self._bbox_centroid(bbox)
+                self.tracks[tid] = {
+                    'bbox': bbox,
+                    'class_id': cls,
+                    'conf': conf,
+                    'disappeared': 0,
+                    'pos3d': pos3d,
+                    'vel3d': np.zeros(3, dtype=np.float32),
+                    'history3d': deque([pos3d], maxlen=self.history_len),
+                    'history2d': deque([(cx, cy)], maxlen=self.history_len),
+                    'vel2d': np.zeros(2, dtype=np.float32),
+                    'feat': feat,  # current appearance
+                    'age': 1,             # <-- NEW
+                    'visible_count': 1,   # <-- NEW (first frame is visible)
+                }
+                self.trajectories[tid] = [pos3d.copy()]
+                self.next_id += 1
+            return
+
+        # 2) No detections -> predict forward and mark disappeared
+        if len(detections) == 0:
+            ids_to_delete = []
+            for tid, tr in self.tracks.items():
+                tr['disappeared'] += 1
+                
+                if self._is_likely_hallucination(tr):
+                    ids_to_delete.append(tid)
+                    continue  # skip prediction
+
+                if np.all(np.isfinite(tr['pos3d'])):
+                    tr['pos3d'] = tr['pos3d'] + tr['vel3d']
+                    proj = self._project_3d(tr['pos3d'])
+                    if proj is not None:
+                        u, v = proj
+                        x1, y1, x2, y2 = tr['bbox']
+                        w = x2 - x1
+                        h = y2 - y1
+                        tr['bbox'] = (
+                            int(u - w / 2), int(v - h / 2),
+                            int(u + w / 2), int(v + h / 2)
+                        )
+                if tr['disappeared'] > self.max_disappeared:
+                    ids_to_delete.append(tid)
+
+            for tid in ids_to_delete:
+                del self.tracks[tid]
+            return
+
+        # 3) We have tracks and detections -> match
+
+        track_ids = list(self.tracks.keys())
+        track_centroids_2d = [self._bbox_centroid(self.tracks[tid]['bbox']) for tid in track_ids]
+        det_centroids_2d = [self._bbox_centroid(d[0]) for d in detections]
+
+        used_dets = set()
+
+        for i, tid in enumerate(track_ids):
+            tr = self.tracks[tid]
+            cx_t, cy_t = track_centroids_2d[i]
+            cls_t = tr['class_id']
+            pos3d_t = tr['pos3d']
+            feat_t = tr.get('feat', None)
+
+            is_occluded = tr['disappeared'] > 0
+
+            best_j = None
+            best_cost = float('inf')
+
+            for j, det in enumerate(detections):
+                if j in used_dets:
+                    continue
+
+                bbox_d, cls_d, conf_d, pos3d_d, feat_d = det
+
+                # class gating
+                if cls_d != cls_t:
+                    continue
+
+                # figure out what data we have
+                track_has_depth = pos3d_t is not None and np.all(np.isfinite(pos3d_t))
+                det_has_depth   = pos3d_d is not None and np.all(np.isfinite(pos3d_d))
+
+                use_3d = track_has_depth and det_has_depth
+
+                # ---------- GEOMETRIC COST ----------
+                if use_3d:
+                    # 3D distance
+                    if is_occluded:
+                        local_max_3d = self.max_distance_3d * 0.5  # stricter when occluded
+                    else:
+                        local_max_3d = self.max_distance_3d
+
+                    d3 = np.linalg.norm(pos3d_t - pos3d_d)
+                    if d3 > local_max_3d:
+                        continue
+                    geom_cost = d3 / local_max_3d
+
+                else:
+                    # ---------- 2D fallback matching ----------
+                    cx_d, cy_d = det_centroids_2d[j]
+
+                    # Velocity-aware predicted center
+                    v2d = tr.get('vel2d', np.zeros(2, dtype=np.float32))
+                    cx_pred = cx_t + v2d[0]
+                    cy_pred = cy_t + v2d[1]
+
+                    # Distance to predicted center instead of last center
+                    d2 = math.hypot(cx_pred - cx_d, cy_pred - cy_d)
+
+                    # Dynamic distance gate based on motion speed
+                    speed = float(np.linalg.norm(v2d))
+
+                    if is_occluded:
+                        # near the frame edge we relax the gate
+                        if frame_shape is not None:
+                            H, W = frame_shape
+                            near_edge = (
+                                cx_t < 40 or cx_t > W - 40 or
+                                cy_t < 40 or cy_t > H - 40
+                            )
+                        else:
+                            near_edge = False
+
+                        if near_edge:
+                            base_2d = self.max_distance_2d * 1.5   # MORE forgiving near edges
+                        else:
+                            base_2d = self.max_distance_2d * 0.5   # stricter when occluded
+                    else:
+                        base_2d = self.max_distance_2d
+
+                    # dynamic threshold grows with speed
+                    local_max_2d = base_2d + 0.4 * speed
+
+                    if d2 > local_max_2d:
+                        continue
+
+                    geom_cost = d2 / local_max_2d
+
+                # ---------- APPEARANCE COST ----------
+                app_cost = 0.5  # neutral default
+                cos_sim = None
+
+                if feat_t is not None and feat_d is not None:
+                    color_t = feat_t.get('color', None)
+                    color_d = feat_d.get('color', None)
+                    orb_t   = feat_t.get('orb', None)
+                    orb_d   = feat_d.get('orb', None)
+
+                    sims = []
+
+                    # color similarity
+                    if color_t is not None and color_d is not None:
+                        ft_c = color_t / (np.linalg.norm(color_t) + 1e-6)
+                        fd_c = color_d / (np.linalg.norm(color_d) + 1e-6)
+                        cos_c = float(np.dot(ft_c, fd_c))
+                        sims.append(cos_c)
+
+                    # ORB similarity (treat mean descriptor as float vector)
+                    if orb_t is not None and orb_d is not None:
+                        ft_o = orb_t / (np.linalg.norm(orb_t) + 1e-6)
+                        fd_o = orb_d / (np.linalg.norm(orb_d) + 1e-6)
+                        cos_o = float(np.dot(ft_o, fd_o))
+                        sims.append(cos_o)
+
+                    if sims:
+                        cos_sim = sum(sims) / len(sims)
+                        cos_sim = max(-1.0, min(1.0, cos_sim))
+                        app_cost = 0.5 * (1.0 - cos_sim)
+                    else:
+                        cos_sim = None
+
+                # for occluded tracks, require stronger appearance agreement if we have cos_sim
+                if is_occluded:
+                    if cos_sim is None:
+                        # no appearance → don't trust
+                        continue
+                    # relax requirement near the border (ROIs are cropped & noisy)
+                    cx_t, cy_t = track_centroids_2d[i]
+                    near_edge = self._is_near_edge((cx_t, cy_t), frame_shape)
+
+                    if near_edge:
+                        min_cos = 0.3   # much more forgiving at the edge
+                    else:
+                        min_cos = 0.5   # stricter in the middle of the frame
+
+                    if cos_sim < min_cos:
+                        continue
+
+                # ---------- COMBINE ----------
+                alpha = 0.7  # geometry weight
+                total_cost = alpha * geom_cost + (1 - alpha) * app_cost
+
+                if total_cost < best_cost:
+                    best_cost = total_cost
+                    best_j = j
+
+            if best_j is not None:
+                # matched
+                bbox_d, cls_d, conf_d, pos3d_d, feat_d = detections[best_j]
+                tr['bbox'] = bbox_d
+                tr['class_id'] = cls_d
+                tr['conf'] = conf_d
+                tr['disappeared'] = 0
+                tr['visible_count'] = tr.get('visible_count', 0) + 1
+                cx_d, cy_d = self._bbox_centroid(bbox_d)
+                if 'history2d' not in tr:
+                    tr['history2d'] = deque(maxlen=self.history_len)
+                tr['history2d'].append((cx_d, cy_d))
+                tr['vel2d'] = self._update_vel2d_from_history(tr)
+
+                # --- 3D update ---
+                if pos3d_d is None:
+                    # No new depth measurement, but we *do* have a 2D detection.
+                    pos_prev = tr['pos3d']
+                    vel_prev = tr.get('vel3d', np.zeros(3, dtype=np.float32))
+
+                    if pos_prev is not None and np.all(np.isfinite(pos_prev)):
+                        # 1) predict forward in 3D using previous velocity
+                        pos_pred = pos_prev + vel_prev * 0.8 # dampening factor because no measurement
+                        Z_pred = pos_pred[2]
+
+                        # fallback if Z becomes invalid
+                        if not np.isfinite(Z_pred) or Z_pred <= 0:
+                            Z_pred = max(pos_prev[2], 1e-3)
+
+                        # 2) align X,Y with current 2D detection using this depth
+                        pos3d_d = self._backproject_uvd(cx_d, cy_d, Z_pred)
+                    else:
+                        # we have no reliable previous 3D; keep whatever we had
+                        pos3d_d = pos_prev
+
+                tr['pos3d'] = pos3d_d
+
+                if pos3d_d is not None and np.all(np.isfinite(pos3d_d)):
+                    tr['history3d'].append(pos3d_d)
+                    tr['vel3d'] = self._update_vel3d_from_history(tr)
+
+                    if tid not in self.trajectories:
+                        self.trajectories[tid] = []
+                    self.trajectories[tid].append(pos3d_d.copy())
+
+                # update appearance with EMA
+                if feat_d is not None:
+                    feat_old = tr.get('feat', None)
+                    if feat_old is None:
+                        tr['feat'] = feat_d
+                    else:
+                        beta = 0.8
+                        new_feat = {}
+
+                        # smooth color histogram
+                        col_old = feat_old.get('color', None)
+                        col_new = feat_d.get('color', None)
+                        if col_old is not None and col_new is not None:
+                            new_feat['color'] = beta * col_old + (1.0 - beta) * col_new
+                        elif col_new is not None:
+                            new_feat['color'] = col_new
+                        else:
+                            new_feat['color'] = col_old
+
+                        # for ORB, just take the latest descriptor if available
+                        orb_new = feat_d.get('orb', None)
+                        orb_old = feat_old.get('orb', None)
+                        new_feat['orb'] = orb_new if orb_new is not None else orb_old
+
+                        tr['feat'] = new_feat
+
+                used_dets.add(best_j)
+
+            else:
+                # unmatched track -> predict forward
+                tr['disappeared'] += 1
+                # --- hallucination early-kill ---
+                if self._is_likely_hallucination(tr):
+                    # we are looping over a *copy* of keys (track_ids),
+                    # so deleting directly is safe here
+                    if tid in self.tracks:
+                        del self.tracks[tid]
+                    continue  # skip prediction
+                if np.all(np.isfinite(tr['pos3d'])):
+                    tr['pos3d'] = tr['pos3d'] + tr['vel3d']
+                    proj = self._project_3d(tr['pos3d'])
+                    if proj is not None:
+                        u, v = proj
+                        x1, y1, x2, y2 = tr['bbox']
+                        w = x2 - x1
+                        h = y2 - y1
+                        tr['bbox'] = (
+                            int(u - w / 2), int(v - h / 2),
+                            int(u + w / 2), int(v + h / 2)
+                        )
+
+        # 4) remove long-disappeared tracks
+        ids_to_delete = [
+            tid for tid, tr in self.tracks.items()
+            if tr['disappeared'] > self.max_disappeared
+        ]
+        for tid in ids_to_delete:
+            del self.tracks[tid]
+
+        # 5) create new tracks for unused detections
+        for j, det in enumerate(detections):
+            if j in used_dets:
+                continue
+            bbox_d, cls_d, conf_d, pos3d_d, feat_d = det
+            if pos3d_d is None:
+                pos3d_d = np.array([np.nan, np.nan, np.nan], dtype=np.float32)
+
+            tid = self.next_id
+            cx_d, cy_d = self._bbox_centroid(bbox_d)
+            self.tracks[tid] = {
+                'bbox': bbox_d,
+                'class_id': cls_d,
+                'conf': conf_d,
+                'disappeared': 0,
+                'pos3d': pos3d_d,
+                'vel3d': np.zeros(3, dtype=np.float32),
+                'history3d': deque([pos3d_d], maxlen=self.history_len),
+                'history2d': deque([(cx_d, cy_d)], maxlen=self.history_len),
+                'vel2d': np.zeros(2, dtype=np.float32),
+                'feat': feat_d,
+                'age': 1,             # <-- NEW
+                'visible_count': 1,   # <-- NEW (first frame is visible)
+            }
+            self.trajectories[tid] = [pos3d_d.copy()]
+            self.next_id += 1
+        # 6) optional: cleanup duplicate tracks
+        self._cleanup_duplicate_tracks()
+
+
+    # ---------- public accessors ----------
+
+    def get_tracks(self):
+        """
+        For 2D drawing: returns {track_id: (bbox, class_id, conf)}.
+        """
+        out = {}
+        for tid, tr in self.tracks.items():
+            if tr['disappeared'] <= self.max_disappeared:
+                out[tid] = (tr['bbox'], tr['class_id'], tr['conf'])
+        return out
+
+    def get_tracks_3d(self):
+        """
+        Optional: returns {track_id: (pos3d, vel3d, class_id, conf)}.
+        """
+        out = {}
+        for tid, tr in self.tracks.items():
+            if tr['disappeared'] <= self.max_disappeared:
+                out[tid] = (tr['pos3d'], tr['vel3d'], tr['class_id'], tr['conf'])
+        return out
+    def get_tracks_with_history2d(self):
+        """
+        Returns {track_id: (bbox, class_id, conf, history2d_list)}
+        where history2d_list is a list of (x, y) points.
+        """
+        out = {}
+        for tid, tr in self.tracks.items():
+            if tr['disappeared'] <= self.max_disappeared:
+                hist2d = list(tr.get('history2d', []))
+                out[tid] = (tr['bbox'], tr['class_id'], tr['conf'], hist2d)
+        return out
