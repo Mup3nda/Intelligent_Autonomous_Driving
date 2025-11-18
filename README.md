@@ -7,8 +7,40 @@
 Computer vision system for autonomous driving using stereo camera calibration, depth estimation, and 3D object detection.
 
 ## Getting Started
-1. Activate Conda enviroment used in PFAS
-2. Install dependencies: `pip install -r requirements.txt`(work in progress)
+
+### Prerequisites
+- Python 3.8 or higher
+- Conda or pip
+- CUDA 11.0+ (optional, for GPU acceleration)
+
+### Installation
+
+1. **Clone the repository:**
+   ```bash
+   git clone <repository-url>
+   cd Intelligent_Autonomous_Driving
+   ```
+
+2. **Activate Conda environment:**
+   ```bash
+   conda activate pfas
+   ```
+
+3. **Install dependencies:**
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+4. **Verify installation:**
+   ```bash
+   python -c "import cv2, torch, ultralytics; print('All dependencies installed successfully!')"
+   ```
+
+### Running the Project
+
+- **Main script:** `python FinalProject.py`
+- **Data location:** Place stereo image pairs in `Rectified Images/seq_*/left/` and `seq_*/right/` directories
+- **Calibration data:** See `Rectified Images/calib_cam_to_cam.txt`
 
 
 
