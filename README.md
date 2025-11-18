@@ -35,12 +35,17 @@ Computer vision system for autonomous driving using stereo camera calibration, d
    ```bash
    python -c "import cv2, torch, ultralytics; print('All dependencies installed successfully!')"
    ```
+5. **Download a pretrained YOLO detection Model**
+https://docs.ultralytics.com/tasks/detect/#models
 
+6. **Download stereo Image sequences uploaded in exam and place them in the project**
 ### Running the Project
 
 - **Main script:** `python FinalProject.py`
 - **Data location:** Place stereo image pairs in `Rectified Images/seq_*/left/` and `seq_*/right/` directories
-- **Calibration data:** See `Rectified Images/calib_cam_to_cam.txt`
+- **Calibration data:** Place in `Rectified Images/calib_cam_to_cam.txt`
+  ** Pretrained Model: ** Place in project root next to FinalProject.py
+  ** Make sure to go throug FinalProject.py and verify all paths are correct for your machine**
 
 
 
