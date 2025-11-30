@@ -1,12 +1,133 @@
 import numpy as np
 import math
 from collections import deque
+import cv2
+class CVKalman2D:
+    """
+    Constant-velocity Kalman filter on image plane using cv2.KalmanFilter.
+    State: [u, v, vu, vv]^T (px, px, px/frame, px/frame)
+    Measurement: [u, v]^T
+    """
+    def __init__(self, u0, v0, dt=1.0, process_var=1.0, meas_var=200.0):
+        self.kf = cv2.KalmanFilter(4, 2)
 
+        # F: state transition matrix
+        self.kf.transitionMatrix = np.array([
+            [1, 0, dt, 0],
+            [0, 1, 0, dt],
+            [0, 0, 1,  0],
+            [0, 0, 0,  1]
+        ], np.float32)
+
+        # H: measurement matrix (we only observe position)
+        self.kf.measurementMatrix = np.array([
+            [1, 0, 0, 0],
+            [0, 1, 0, 0]
+        ], np.float32)
+
+        # Q: process noise
+        self.kf.processNoiseCov = (process_var *
+                                   np.eye(4, dtype=np.float32))
+
+        # R: measurement noise
+        self.kf.measurementNoiseCov = (meas_var *
+                                       np.eye(2, dtype=np.float32))
+
+        # P: initial error covariance
+        self.kf.errorCovPost = np.eye(4, dtype=np.float32) * 100.0
+
+        # Initial state
+        self.kf.statePost = np.array([[u0], [v0], [0.0], [0.0]],
+                                     dtype=np.float32)
+
+    def predict(self):
+        pred = self.kf.predict()
+        return pred  # 4x1
+
+    def update(self, u, v):
+        meas = np.array([[u], [v]], dtype=np.float32)
+        est = self.kf.correct(meas)
+        return est  # 4x1
+
+    @property
+    def pos(self):
+        # current best estimate of (u, v)
+        state = self.kf.statePost
+        return float(state[0, 0]), float(state[1, 0])
+
+    @property
+    def vel(self):
+        state = self.kf.statePost
+        return float(state[2, 0]), float(state[3, 0])
+
+
+class CVKalman3D:
+    """
+    Constant-velocity Kalman filter in 3D camera space.
+    State: [X, Y, Z, Vx, Vy, Vz]^T
+    Measurement: [X, Y, Z]^T (from stereo/depth)
+    """
+    def __init__(self, X0, Y0, Z0, dt=1.0,
+                 process_var=1.0, meas_var=300):
+        self.kf = cv2.KalmanFilter(6, 3)
+
+        # F: state transition
+        self.kf.transitionMatrix = np.array([
+            [1, 0, 0, dt, 0,  0],
+            [0, 1, 0, 0,  dt, 0],
+            [0, 0, 1, 0,  0,  dt],
+            [0, 0, 0, 1,  0,  0],
+            [0, 0, 0, 0,  1,  0],
+            [0, 0, 0, 0,  0,  1],
+        ], np.float32)
+
+        # H: we observe positions only
+        self.kf.measurementMatrix = np.array([
+            [1, 0, 0, 0, 0, 0],
+            [0, 1, 0, 0, 0, 0],
+            [0, 0, 1, 0, 0, 0],
+        ], np.float32)
+
+        self.kf.processNoiseCov = (process_var *
+                                   np.eye(6, dtype=np.float32))
+        self.kf.measurementNoiseCov = (meas_var *
+                                       np.eye(3, dtype=np.float32))
+        self.kf.errorCovPost = np.eye(6, dtype=np.float32) * 100.0
+
+        # Initial state
+        self.kf.statePost = np.array(
+            [[X0], [Y0], [Z0], [0.0], [0.0], [0.0]],
+            dtype=np.float32
+        )
+
+    def predict(self):
+        pred = self.kf.predict()
+        return pred  # 6x1
+
+    def update(self, X, Y, Z):
+        meas = np.array([[X], [Y], [Z]], dtype=np.float32)
+        est = self.kf.correct(meas)
+        return est
+
+    @property
+    def pos(self):
+        state = self.kf.statePost
+        return (float(state[0, 0]),
+                float(state[1, 0]),
+                float(state[2, 0]))
+
+    @property
+    def vel(self):
+        state = self.kf.statePost
+        return (float(state[3, 0]),
+                float(state[4, 0]),
+                float(state[5, 0]))
+    
 class SimpleTracker3D:
     def __init__(self, K,
-                 max_disappeared=15,
-                 max_distance_3d=1.0,    # meters
-                 max_distance_2d=20.0,   # pixels (fallback)
+                 max_disappeared=30,
+                 max_distance_3d=5.0,    # meters
+                 max_distance_2d=30.0,   # pixels (fallback)
                  history_len=10):
         """
         K: 3x3 camera intrinsics for projection.
@@ -22,11 +143,10 @@ class SimpleTracker3D:
 
         self.fx = K[0, 0]; self.fy = K[1, 1]
         self.cx = K[0, 2]; self.cy = K[1, 2]
-        # --- new: velocity limits & hallucination params ---
-        self.max_speed_2d = 30.0     # px/frame (tweak)
-        self.max_speed_3d = 3.0      # m/frame  (tweak)
-        self.min_speed_for_valid = 0.05  # m/frame *and* px/frame
+        
+        self.min_speed_for_valid = 1  # m/frame *and* px/frame
         self.hallucinated_frac = 0.3     # 0.3 * max_disappeared
+        self.history = {}
     # ---------- helpers ----------
     def _clamp_vec(self, v, max_norm):
         n = float(np.linalg.norm(v))
@@ -36,59 +156,7 @@ class SimpleTracker3D:
     def _bbox_centroid(self, bbox):
         x1, y1, x2, y2 = bbox
         return 0.5 * (x1 + x2), 0.5 * (y1 + y2)
-    def _update_vel2d_from_history(self, track):
-        hist2d = track.get('history2d', None)
-        if hist2d is None or len(hist2d) < 2:
-            return track.get('vel2d', np.zeros(2, dtype=np.float32))
-
-        (x_prev, y_prev) = hist2d[-2]
-        (x_curr, y_curr) = hist2d[-1]
-        v_inst = np.array([x_curr - x_prev, y_curr - y_prev], dtype=np.float32)
-
-        v_old = track.get('vel2d', np.zeros(2, dtype=np.float32))
-        gamma = 0.7  # smooth
-        v = gamma * v_old + (1.0 - gamma) * v_inst
-
-        # clamp
-        v = self._clamp_vec(v, self.max_speed_2d)
-        return v
-    def _update_vel3d_from_history(self, track):
-        hist = track['history3d']
-        if len(hist) < 2:
-            return track['vel3d']
-
-        # use last two points instead of full history
-        p_prev = hist[-2]
-        p_curr = hist[-1]
-        dt = 1.0  # 1 frame; or store timestamps if needed
-
-        v_inst = (p_curr - p_prev) / dt
-
-        # optionally smooth with previous velocity
-        v_old = track.get('vel3d', np.zeros(3, dtype=np.float32))
-        gamma = 0.7  # 70% old, 30% new
-        v = gamma * v_old + (1 - gamma) * v_inst
-        # clamp
-        v = self._clamp_vec(v, self.max_speed_3d)
-        return v
-    def _backproject_uvd(self, u, v, depth):
-        """Backproject pixel (u,v) with depth into camera coords."""
-        X = (u - self.cx) * depth / self.fx
-        Y = (v - self.cy) * depth / self.fy
-        return np.array([X, Y, depth], dtype=np.float32)
-    def _project_3d(self, pos3d):
-        """
-        Project 3D point (camera coords) to image pixel coords.
-        Returns np.array([u, v]) or None if invalid.
-        """
-        X, Y, Z = pos3d
-        if not np.isfinite(Z) or Z <= 0:
-            return None
-        u = self.fx * X / Z + self.cx
-        v = self.fy * Y / Z + self.cy
-        if not np.isfinite(u) or not np.isfinite(v):
-            return None
-        return np.array([u, v], dtype=np.float32)
+    
     def _is_near_edge(self, point, frame_shape, margin=40):
         if frame_shape is None:
             return False
@@ -184,22 +252,45 @@ class SimpleTracker3D:
             return False
 
         # must be occluded most of their life
-        if frac_occluded < 0.6:       # e.g. >60% of life occluded
+        if frac_occluded < 0.4:       # e.g. >60% of life occluded
             return False
 
         # must have been barely visible
-        if visible > 2:               # seen clearly more than a couple frames -> keep
+        if visible > 5:               # seen clearly more than a couple frames -> keep
             return False
 
         # must be almost not moving
         if (np.linalg.norm(v3) >= self.min_speed_for_valid or
-            np.linalg.norm(v2) >= self.min_speed_for_valid):
+            np.linalg.norm(v2) >= self.min_speed_for_valid*2):
             return False
 
         return True
+    
+    def _has_exited_frame(self, tr, frame_shape, margin=20):
+        """
+        Heuristic: if the last bbox center is near the border and the track
+        is disappearing, we assume they left the frame.
+        """
+        if frame_shape is None:
+            return False
+
+        if tr.get('disappeared', 0) == 0:
+            return False
+
+        H, W = frame_shape
+        x1, y1, x2, y2 = tr['bbox']
+        cx = 0.5 * (x1 + x2)
+        cy = 0.5 * (y1 + y2)
+
+        near_edge = (
+            cx < margin or cx > W - margin or
+            cy < margin or cy > H - margin
+        )
+        return near_edge
+
     # ---------- main update ----------
 
-    def update(self, detections, frame_shape=None):
+    def update(self, detections, frame_shape=None,frame_idx=None):
         """
         detections: list of (bbox, class_id, confidence, pos3d, feat)
         pos3d: np.array([X,Y,Z]) in meters, or None if depth invalid.
@@ -208,6 +299,22 @@ class SimpleTracker3D:
         # increment age for all existing tracks
         for tr in self.tracks.values():
             tr['age'] = tr.get('age', 0) + 1
+        # Kalman prediction for all tracks
+        for tid, tr in self.tracks.items():
+            
+            kf2d = tr.get('kf2d', None)
+            if kf2d is not None:
+                kf2d.predict()
+                tr['pred_center'] = kf2d.pos  # (u_pred, v_pred)
+            else:
+                tr['pred_center'] = self._bbox_centroid(tr['bbox'])
+
+            kf3d = tr.get('kf3d', None)
+            if kf3d is not None:
+                kf3d.predict()
+                tr['pos3d_pred'] = np.array(kf3d.pos, dtype=np.float32)
+            else:
+                tr['pos3d_pred'] = tr['pos3d']
 
         # 1) No existing tracks -> start one per detection
         if len(self.tracks) == 0:
@@ -217,6 +324,13 @@ class SimpleTracker3D:
 
                 tid = self.next_id
                 cx, cy = self._bbox_centroid(bbox)
+
+                kf2d = CVKalman2D(cx, cy)
+                kf3d = None
+                if pos3d is not None and np.all(np.isfinite(pos3d)):
+                    X0, Y0, Z0 = float(pos3d[0]), float(pos3d[1]), float(pos3d[2])
+                    kf3d = CVKalman3D(X0, Y0, Z0)
+
                 self.tracks[tid] = {
                     'bbox': bbox,
                     'class_id': cls,
@@ -227,9 +341,16 @@ class SimpleTracker3D:
                     'history3d': deque([pos3d], maxlen=self.history_len),
                     'history2d': deque([(cx, cy)], maxlen=self.history_len),
                     'vel2d': np.zeros(2, dtype=np.float32),
+                    'kf2d': kf2d,        # 2D Kalman filter
+                    'kf3d': kf3d,        # 3D Kalman filter 
                     'feat': feat,  # current appearance
-                    'age': 1,             # <-- NEW
-                    'visible_count': 1,   # <-- NEW (first frame is visible)
+                    'age': 1,             # new track
+                    'visible_count': 1,   # visible this frame
+                    #error tracking
+                    'reacquired_this_frame': False,
+                    'last_reacq_jump2d': None,
+                    'last_reacq_jump3d': None,
+
                 }
                 self.trajectories[tid] = [pos3d.copy()]
                 self.next_id += 1
@@ -244,19 +365,26 @@ class SimpleTracker3D:
                 if self._is_likely_hallucination(tr):
                     ids_to_delete.append(tid)
                     continue  # skip prediction
+                 # Early kill if they clearly exited at the edge
+                if self._has_exited_frame(tr, frame_shape):
+                    ids_to_delete.append(tid)
+                    continue
+                kf2d = tr.get('kf2d', None)
+                if kf2d is not None:
+                    u_pred, v_pred = tr.get('pred_center', kf2d.pos)
+                    x1, y1, x2, y2 = tr['bbox']
+                    w = x2 - x1
+                    h = y2 - y1
+                    tr['bbox'] = (
+                        int(u_pred - w / 2), int(v_pred - h / 2),
+                        int(u_pred + w / 2), int(v_pred + h / 2)
+                    )
 
-                if np.all(np.isfinite(tr['pos3d'])):
-                    tr['pos3d'] = tr['pos3d'] + tr['vel3d']
-                    proj = self._project_3d(tr['pos3d'])
-                    if proj is not None:
-                        u, v = proj
-                        x1, y1, x2, y2 = tr['bbox']
-                        w = x2 - x1
-                        h = y2 - y1
-                        tr['bbox'] = (
-                            int(u - w / 2), int(v - h / 2),
-                            int(u + w / 2), int(v + h / 2)
-                        )
+                kf3d = tr.get('kf3d', None)
+                if kf3d is not None:
+                    # we've already called predict() at the top, so just copy
+                    tr['pos3d'] = np.array(tr['pos3d_pred'], dtype=np.float32)
+                    tr['vel3d'] = np.array(kf3d.vel, dtype=np.float32)
                 if tr['disappeared'] > self.max_disappeared:
                     ids_to_delete.append(tid)
 
@@ -267,7 +395,11 @@ class SimpleTracker3D:
         # 3) We have tracks and detections -> match
 
         track_ids = list(self.tracks.keys())
-        track_centroids_2d = [self._bbox_centroid(self.tracks[tid]['bbox']) for tid in track_ids]
+        track_centroids_2d = [
+                                self.tracks[tid].get('pred_center',
+                                                    self._bbox_centroid(self.tracks[tid]['bbox']))
+                                for tid in track_ids
+                             ]
         det_centroids_2d = [self._bbox_centroid(d[0]) for d in detections]
 
         used_dets = set()
@@ -276,7 +408,7 @@ class SimpleTracker3D:
             tr = self.tracks[tid]
             cx_t, cy_t = track_centroids_2d[i]
             cls_t = tr['class_id']
-            pos3d_t = tr['pos3d']
+            pos3d_t = tr.get('pos3d_pred', tr['pos3d'])
             feat_t = tr.get('feat', None)
 
             is_occluded = tr['disappeared'] > 0
@@ -319,10 +451,7 @@ class SimpleTracker3D:
 
                     # Velocity-aware predicted center
                     v2d = tr.get('vel2d', np.zeros(2, dtype=np.float32))
-                    cx_pred = cx_t + v2d[0]
-                    cy_pred = cy_t + v2d[1]
-
-                    # Distance to predicted center instead of last center
+                    cx_pred, cy_pred = self.tracks[tid].get('pred_center', track_centroids_2d[i])
                     d2 = math.hypot(cx_pred - cx_d, cy_pred - cy_d)
 
                     # Dynamic distance gate based on motion speed
@@ -340,9 +469,10 @@ class SimpleTracker3D:
                             near_edge = False
 
                         if near_edge:
-                            base_2d = self.max_distance_2d * 1.5   # MORE forgiving near edges
+                            base_2d = self.max_distance_2d * 0.5   # stricter at edges when occluded
                         else:
-                            base_2d = self.max_distance_2d * 0.5   # stricter when occluded
+                            base_2d = self.max_distance_2d * 0.7   # slightly stricter overall
+
                     else:
                         base_2d = self.max_distance_2d
 
@@ -397,9 +527,9 @@ class SimpleTracker3D:
                     near_edge = self._is_near_edge((cx_t, cy_t), frame_shape)
 
                     if near_edge:
-                        min_cos = 0.3   # much more forgiving at the edge
+                        min_cos = 0.6   # need pretty good match at edge
                     else:
-                        min_cos = 0.5   # stricter in the middle of the frame
+                        min_cos = 0.5 # moderate match needed
 
                     if cos_sim < min_cos:
                         continue
@@ -415,48 +545,75 @@ class SimpleTracker3D:
             if best_j is not None:
                 # matched
                 bbox_d, cls_d, conf_d, pos3d_d, feat_d = detections[best_j]
+                prev_disappeared = tr['disappeared']
+                # predicted center before correction (from Kalman)
+                u_pred, v_pred = tr.get('pred_center',
+                                        self._bbox_centroid(tr['bbox']))
+                cx_d, cy_d = self._bbox_centroid(bbox_d)
+
+                # predicted 3D position before correction (if available)
+                pos3d_pred_before = tr.get('pos3d_pred', tr.get('pos3d', None))
+
+                # --- reacquisition metrics (must be BEFORE KF update) ---
+                if prev_disappeared > 0:
+                    # track was occluded, now reacquired
+                    jump2d = math.hypot(cx_d - u_pred, cy_d - v_pred)
+                    tr['last_reacq_jump2d'] = jump2d
+
+                    if pos3d_d is not None and np.all(np.isfinite(pos3d_d)) \
+                    and pos3d_pred_before is not None and np.all(np.isfinite(pos3d_pred_before)):
+                        jump3d = float(np.linalg.norm(pos3d_d - pos3d_pred_before))
+                        tr['last_reacq_jump3d'] = jump3d
+                    else:
+                        tr['last_reacq_jump3d'] = None
+
+                    tr['reacquired_this_frame'] = True
+                else:
+                    tr['reacquired_this_frame'] = False
+                    tr['last_reacq_jump2d'] = tr.get('last_reacq_jump2d', None)
+                    tr['last_reacq_jump3d'] = tr.get('last_reacq_jump3d', None)
+                # --- 2D update ---
                 tr['bbox'] = bbox_d
                 tr['class_id'] = cls_d
                 tr['conf'] = conf_d
                 tr['disappeared'] = 0
                 tr['visible_count'] = tr.get('visible_count', 0) + 1
-                cx_d, cy_d = self._bbox_centroid(bbox_d)
+                # 2D KF update
+                kf2d = tr.get('kf2d', None)
+                if kf2d is None:
+                    kf2d = CVKalman2D(cx_d, cy_d)
+                    tr['kf2d'] = kf2d
+                
+                kf2d.update(cx_d, cy_d)
+                tr['pred_center'] = kf2d.pos
                 if 'history2d' not in tr:
                     tr['history2d'] = deque(maxlen=self.history_len)
-                tr['history2d'].append((cx_d, cy_d))
-                tr['vel2d'] = self._update_vel2d_from_history(tr)
+                tr['history2d'].append((kf2d.pos))
+                vx, vy = kf2d.vel
+                tr['vel2d'] = np.array([vx, vy], dtype=np.float32)
 
                 # --- 3D update ---
-                if pos3d_d is None:
-                    # No new depth measurement, but we *do* have a 2D detection.
-                    pos_prev = tr['pos3d']
-                    vel_prev = tr.get('vel3d', np.zeros(3, dtype=np.float32))
-
-                    if pos_prev is not None and np.all(np.isfinite(pos_prev)):
-                        # 1) predict forward in 3D using previous velocity
-                        pos_pred = pos_prev + vel_prev * 0.8 # dampening factor because no measurement
-                        Z_pred = pos_pred[2]
-
-                        # fallback if Z becomes invalid
-                        if not np.isfinite(Z_pred) or Z_pred <= 0:
-                            Z_pred = max(pos_prev[2], 1e-3)
-
-                        # 2) align X,Y with current 2D detection using this depth
-                        pos3d_d = self._backproject_uvd(cx_d, cy_d, Z_pred)
-                    else:
-                        # we have no reliable previous 3D; keep whatever we had
-                        pos3d_d = pos_prev
-
-                tr['pos3d'] = pos3d_d
-
+                # 3D KF update (if we have usable depth)
                 if pos3d_d is not None and np.all(np.isfinite(pos3d_d)):
-                    tr['history3d'].append(pos3d_d)
-                    tr['vel3d'] = self._update_vel3d_from_history(tr)
+                    Xd, Yd, Zd = float(pos3d_d[0]), float(pos3d_d[1]), float(pos3d_d[2])
+                    kf3d = tr.get('kf3d', None)
+                    if kf3d is None:
+                        kf3d = CVKalman3D(Xd, Yd, Zd)
+                        tr['kf3d'] = kf3d
+                    kf3d.update(Xd, Yd, Zd)
+                    tr['pos3d'] = np.array(kf3d.pos, dtype=np.float32)
+                    tr['pos3d_pred'] = tr['pos3d']
+                    tr['vel3d'] = np.array(kf3d.vel, dtype=np.float32)
+                else:
+                    # if no new depth, keep previous pos3d / pos3d_pred as is
+                    pass
+                # update 3D history
+                if pos3d_d is not None and np.all(np.isfinite(pos3d_d)):
+                    tr['history3d'].append(kf3d.pos)
 
                     if tid not in self.trajectories:
                         self.trajectories[tid] = []
-                    self.trajectories[tid].append(pos3d_d.copy())
-
+                    self.trajectories[tid].append(kf3d.pos)
                 # update appearance with EMA
                 if feat_d is not None:
                     feat_old = tr.get('feat', None)
@@ -488,6 +645,22 @@ class SimpleTracker3D:
             else:
                 # unmatched track -> predict forward
                 tr['disappeared'] += 1
+                kf2d = tr.get('kf2d', None)
+                if kf2d is not None:
+                    u_pred, v_pred = tr.get('pred_center', kf2d.pos)
+                    x1, y1, x2, y2 = tr['bbox']
+                    w = x2 - x1
+                    h = y2 - y1
+                    tr['bbox'] = (
+                        int(u_pred - w / 2), int(v_pred - h / 2),
+                        int(u_pred + w / 2), int(v_pred + h / 2)
+                    )
+
+                kf3d = tr.get('kf3d', None)
+                if kf3d is not None:
+                    # we've already called predict() at the top, so just copy
+                    tr['pos3d'] = np.array(tr['pos3d_pred'], dtype=np.float32)
+                    tr['vel3d'] = np.array(kf3d.vel, dtype=np.float32)
                 # --- hallucination early-kill ---
                 if self._is_likely_hallucination(tr):
                     # we are looping over a *copy* of keys (track_ids),
@@ -495,24 +668,15 @@ class SimpleTracker3D:
                     if tid in self.tracks:
                         del self.tracks[tid]
                     continue  # skip prediction
-                if np.all(np.isfinite(tr['pos3d'])):
-                    tr['pos3d'] = tr['pos3d'] + tr['vel3d']
-                    proj = self._project_3d(tr['pos3d'])
-                    if proj is not None:
-                        u, v = proj
-                        x1, y1, x2, y2 = tr['bbox']
-                        w = x2 - x1
-                        h = y2 - y1
-                        tr['bbox'] = (
-                            int(u - w / 2), int(v - h / 2),
-                            int(u + w / 2), int(v + h / 2)
-                        )
+        # end of matching loop
 
         # 4) remove long-disappeared tracks
-        ids_to_delete = [
-            tid for tid, tr in self.tracks.items()
-            if tr['disappeared'] > self.max_disappeared
-        ]
+        ids_to_delete = []
+        for tid, tr in self.tracks.items():
+            if tr['disappeared'] > self.max_disappeared:
+                ids_to_delete.append(tid)
+            elif self._has_exited_frame(tr, frame_shape):
+                ids_to_delete.append(tid)
         for tid in ids_to_delete:
             del self.tracks[tid]
 
@@ -526,6 +690,12 @@ class SimpleTracker3D:
 
             tid = self.next_id
             cx_d, cy_d = self._bbox_centroid(bbox_d)
+            kf2d = CVKalman2D(cx_d, cy_d)
+            kf3d = None
+            if pos3d_d is not None and np.all(np.isfinite(pos3d_d)):
+                X0, Y0, Z0 = float(pos3d_d[0]), float(pos3d_d[1]), float(pos3d_d[2])
+                kf3d = CVKalman3D(X0, Y0, Z0)
+
             self.tracks[tid] = {
                 'bbox': bbox_d,
                 'class_id': cls_d,
@@ -537,14 +707,43 @@ class SimpleTracker3D:
                 'history2d': deque([(cx_d, cy_d)], maxlen=self.history_len),
                 'vel2d': np.zeros(2, dtype=np.float32),
                 'feat': feat_d,
-                'age': 1,             # <-- NEW
-                'visible_count': 1,   # <-- NEW (first frame is visible)
+                'age': 1,
+                'visible_count': 1,
+                'kf2d': kf2d,
+                'kf3d': kf3d,
+                'reacquired_this_frame': False,
+                'last_reacq_jump2d': None,
+                'last_reacq_jump3d': None,
             }
             self.trajectories[tid] = [pos3d_d.copy()]
             self.next_id += 1
         # 6) optional: cleanup duplicate tracks
         self._cleanup_duplicate_tracks()
+        # 7) LOGGING: snapshot state for this frame
+        if frame_idx is not None:
+            for tid, tr in self.tracks.items():
+                pos3d = tr['pos3d']
+                if pos3d is not None and np.all(np.isfinite(pos3d)):
+                    pos3d_log = pos3d.copy()
+                else:
+                    pos3d_log = None
 
+                center = self._bbox_centroid(tr['bbox'])
+                rec = {
+                    'frame': frame_idx,
+                    'visible': (tr['disappeared'] == 0),
+                    'disappeared': tr['disappeared'],
+                    'center': center,
+                    'pos3d': pos3d_log,
+                    'reacquired': tr.get('reacquired_this_frame', False),
+                    'jump2d': tr.get('last_reacq_jump2d', None),
+                    'jump3d': tr.get('last_reacq_jump3d', None),
+                }
+
+                self.history.setdefault(tid, []).append(rec)
+
+                # reset per-frame flag
+                tr['reacquired_this_frame'] = False
 
     # ---------- public accessors ----------
 
@@ -578,3 +777,6 @@ class SimpleTracker3D:
                 hist2d = list(tr.get('history2d', []))
                 out[tid] = (tr['bbox'], tr['class_id'], tr['conf'], hist2d)
         return out
+    
+    def get_history(self):
+        return self.history

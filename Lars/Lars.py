@@ -285,7 +285,7 @@ def compute_depth_map(left_img,
       2) Compute disparity (StereoBM/StereoSGBM)
       3) Convert disparity → depth using calibration
     """
-    # 1) Preprocess stereo pair
+    # 1) Preprocess stereo pair returns scaled grayscale images
     left_proc, right_proc = preprocess_stereo_pair(
         left_img, right_img,
         scale=scale,
@@ -293,12 +293,43 @@ def compute_depth_map(left_img,
     )
 
     # 2) Disparity
-    disparity = compute_disparity_map(
+    disparity_small = compute_disparity_map(
+        left_proc,
+        right_proc,
+        method=matcher_method
+    )
+    # 2) Disparity (computed at the downsampled resolution)
+    disparity_small = compute_disparity_map(
         left_proc,
         right_proc,
         method=matcher_method
     )
 
+    # Upscale disparity back to the original image resolution.
+    # Note: disparities computed on a downsampled image must be scaled by 1/scale
+    # to match the original image pixel coordinates.
+    if scale == 0:
+        raise ValueError("scale must be non-zero")
+
+    inv_scale = 1.0 / scale
+
+    # Preserve validity mask so invalid pixels don't produce bogus values after resize
+    valid_mask = np.isfinite(disparity_small)
+    disp_to_resize = disparity_small.copy()
+    disp_to_resize[~valid_mask] = 0.0
+
+    # Resize to original image size (cv2.resize uses (width, height) target)
+    h_orig, w_orig = left_img.shape[:2]
+    disparity = cv2.resize(disp_to_resize, (w_orig, h_orig), interpolation=cv2.INTER_LINEAR)
+
+    # Resize mask with nearest interpolation to keep boolean integrity
+    mask_resized = cv2.resize(valid_mask.astype(np.uint8), (w_orig, h_orig), interpolation=cv2.INTER_NEAREST).astype(bool)
+
+    # Scale disparity values to original-pixel units
+    disparity = disparity.astype(np.float32) * inv_scale
+
+    # Restore invalid pixels
+    disparity[~mask_resized] = np.nan
     # 3) Depth
     depth = disparity_to_depth(disparity, stereo_params)
 
@@ -310,11 +341,11 @@ def compute_depth_map(left_img,
 
 if __name__ == "__main__":
     # Example paths – change to your own
-    calib_path = r"C:\Users\larst\Downloads\34759 Perception for autonomous systems, Fall 2025 - 11182025 - 744 PM\34759_final_project_rect\34759_final_project_rect\calib_cam_to_cam.txt"
+    calib_path = r"c:\Program Files\StartJupyter\PFAS\Final Project\Rectified Images\calib_cam_to_cam.txt"
     #02
-    left_img_path = r"C:\Users\larst\Downloads\34759 Perception for autonomous systems, Fall 2025 - 11182025 - 744 PM\34759_final_project_rect\34759_final_project_rect\seq_01\image_02\data\000140.png" 
+    left_img_path = r"c:\Program Files\StartJupyter\PFAS\Final Project\Rectified Images\seq_01\left\data\000140.png" 
     #03
-    right_img_path = r"C:\Users\larst\Downloads\34759 Perception for autonomous systems, Fall 2025 - 11182025 - 744 PM\34759_final_project_rect\34759_final_project_rect\seq_01\image_03\data\000140.png"
+    right_img_path = r"c:\Program Files\StartJupyter\PFAS\Final Project\Rectified Images\seq_01\right\data\000140.png"
 
     # Load calibration
     calibration = load_camera_calibration(calib_path)

@@ -1,4 +1,5 @@
 import os
+import csv
 import numpy as np
 import cv2
 from ultralytics import YOLO
@@ -9,6 +10,7 @@ from DepthHandling import compute_depth_map, bbox_depth, depth_to_3d,depth_to_vi
 from featureExtraction import extract_roi_features
 from Tracker import SimpleTracker3D
 from visualization import save_trajectories_csv, show_trajectories_topdown,draw_tracks_and_trajectories
+from plots import plot_track_trajectories_with_occlusion, plot_reacquisition_error,save_reacquisition_errors_csv,save_track_history_csv
 
 
 def process_sequence(seq_path, stereo_params, detection_model, class_names):
@@ -17,14 +19,14 @@ def process_sequence(seq_path, stereo_params, detection_model, class_names):
     K_left = stereo_params['K_left']
     tracker = SimpleTracker3D(K_left,
                               max_disappeared=45,
-                              max_distance_3d=5.0,   # tune
-                              max_distance_2d=15.0,
+                              max_distance_3d=1.5,   # tune
+                              max_distance_2d=30.0,
                               history_len=10)  # tune
     bg_subtractor = cv2.createBackgroundSubtractorMOG2(history=500,
                                                        varThreshold=16,
                                                        detectShadows=True  # shadows will be marked as 127
                                                        )
-    for left_name, right_name in zip(left_imgs, right_imgs):
+    for frame_idx, (left_name, right_name) in enumerate(zip(left_imgs, right_imgs)):
         left_path = os.path.join(seq_path, 'left', 'data', left_name)
         right_path = os.path.join(seq_path, 'right', 'data', right_name)
 
@@ -40,7 +42,7 @@ def process_sequence(seq_path, stereo_params, detection_model, class_names):
         fg_mask_bin = cv2.morphologyEx(fg_mask_bin, cv2.MORPH_OPEN,
                                     cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
         # 1) detection (2D)
-        det2d = detect_objects_in_frame(left_img, detection_model,conf_thres=0.5, max_detections=20)
+        det2d = detect_objects_in_frame(left_img, detection_model,conf_thres=0.5, max_detections=300)
 
         # 2) depth
         depth_map, disparity = compute_depth_map(left_img, right_img, stereo_params)
@@ -61,7 +63,7 @@ def process_sequence(seq_path, stereo_params, detection_model, class_names):
 
         # 4) update tracker
         H, W = left_img.shape[:2]
-        tracker.update(det3d, frame_shape=(H, W))
+        tracker.update(det3d, frame_shape=(H, W),frame_idx=frame_idx)
 
         # 5) visualize
         tracks2d_hist = tracker.get_tracks_with_history2d()
@@ -80,6 +82,10 @@ def process_sequence(seq_path, stereo_params, detection_model, class_names):
 
 
 # Load calibration
+#Our custom calibration file
+custom_calib_path = r"c:\Program Files\StartJupyter\PFAS\Final Project\Rectified Images\calib_custom.txt"
+custom_calibration = load_camera_calibration(custom_calib_path)
+# GT caibration file 
 calib_path = r"c:\Program Files\StartJupyter\PFAS\Final Project\Rectified Images\calib_cam_to_cam.txt"
 calibration = load_camera_calibration(calib_path)
 
@@ -88,8 +94,8 @@ for key in sorted(calibration.keys()):
     print(f"  {key}: shape {calibration[key].shape}")
 
 # Setup stereo pair (cameras 02 left, 03 right)
+#custom_stereo = setup_stereo_camera(calibration, left_id='00', right_id='01')
 stereo = setup_stereo_camera(calibration, left_id='02', right_id='03')
-
 print("\n--- Stereo Camera (02 left, 03 right) ---")
 print("K_left:\n", stereo['K_left'])
 print("\nK_right:\n", stereo['K_right'])
@@ -98,7 +104,7 @@ print("\nT (translation):\n", stereo['T'])
 print("\nBaseline (distance):", np.linalg.norm(stereo['T']), "m")
 
 
-seq_01_path = r"c:\Program Files\StartJupyter\PFAS\Final Project\Rectified Images\seq_02"
+seq_01_path = r"c:\Program Files\StartJupyter\PFAS\Final Project\Rectified Images\seq_01"
 left_imgs, right_imgs, labels = load_sequence(seq_01_path)
 
 print(f"Loaded {len(left_imgs)} left images, {len(right_imgs)} right images")
@@ -109,5 +115,80 @@ class_names = {0: "person", 1: "bicycle", 2: "car"}
 
 tracker = process_sequence(seq_01_path, stereo, detection_model, class_names)
 print("Finished tracking. Trajectories:", {tid: len(t) for tid, t in tracker.trajectories.items()})
+history = tracker.get_history()
+print("History keys:", list(history.keys()))
+print("History: #tracks =", len(history))
+for tid, entries in history.items():
+    non_none_3d = sum(e['pos3d'] is not None for e in entries)
+    print(f"Track {tid}: {len(entries)} frames, {non_none_3d} frames with 3D")
+    # just inspect first couple of tracks
+    print("  first entry:", entries[0])
+    break
 save_trajectories_csv(tracker, "C:/Program Files/StartJupyter/PFAS/Final Project/trajectories_3d.csv")
-show_trajectories_topdown(tracker)
+#show_trajectories_topdown(tracker)
+# ==== INLINE EXPORT OF FULL HISTORY ====
+history = tracker.get_history()
+print("History: #tracks =", len(history))
+
+base_dir = r"C:\Program Files\StartJupyter\PFAS\Final Project"
+os.makedirs(base_dir, exist_ok=True)
+
+history_path = os.path.join(base_dir, "track_history1.csv")
+reacq_path   = os.path.join(base_dir, "reacq_errors1.csv")
+
+print("Writing track history to:", history_path)
+with open(history_path, 'w', newline='') as f:
+    writer = csv.writer(f)
+    writer.writerow([
+        'track_id', 'frame', 'visible', 'disappeared',
+        'center_u', 'center_v',
+        'pos3d_x', 'pos3d_y', 'pos3d_z',
+        'reacquired', 'jump2d', 'jump3d'
+    ])
+
+    for tid, entries in history.items():
+        for e in entries:
+            center_u, center_v = e['center']
+            pos3d = e['pos3d']
+            if pos3d is None or not np.all(np.isfinite(pos3d)):
+                x, y, z = np.nan, np.nan, np.nan
+            else:
+                x, y, z = float(pos3d[0]), float(pos3d[1]), float(pos3d[2])
+
+            writer.writerow([
+                int(tid),
+                int(e['frame']),
+                int(bool(e['visible'])),
+                int(e['disappeared']),
+                float(center_u),
+                float(center_v),
+                x, y, z,
+                int(bool(e['reacquired'])),
+                e['jump2d'] if e['jump2d'] is not None else np.nan,
+                e['jump3d'] if e['jump3d'] is not None else np.nan,
+            ])
+
+print("Done writing track_history.csv")
+
+# ==== INLINE EXPORT OF REACQUISITION EVENTS ONLY ====
+print("Writing reacquisition errors to:", reacq_path)
+count = 0
+with open(reacq_path, 'w', newline='') as f:
+    writer = csv.writer(f)
+    writer.writerow(['track_id', 'frame', 'jump2d', 'jump3d'])
+
+    for tid, entries in history.items():
+        for e in entries:
+            if not e['reacquired']:
+                continue
+            j2 = e['jump2d']
+            j3 = e['jump3d']
+            writer.writerow([
+                int(tid),
+                int(e['frame']),
+                j2 if j2 is not None else np.nan,
+                j3 if j3 is not None else np.nan,
+            ])
+            count += 1
+
+print(f"Done writing reacq_errors.csv with {count} events")

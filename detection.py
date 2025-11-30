@@ -1,7 +1,7 @@
 import cv2
 from ultralytics import YOLO
 
-def detect_objects_in_frame(img, model, conf_thres=0.3, max_detections=20):
+def detect_objects_in_frame(img, model, conf_thres=0.3, max_detections=100):
     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     results = model.predict(img_rgb, verbose=False)[0]
 
