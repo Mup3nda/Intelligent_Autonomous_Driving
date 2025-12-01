@@ -260,9 +260,9 @@ class SimpleTracker3D:
             return False
 
         # must be almost not moving
-        if (np.linalg.norm(v3) >= self.min_speed_for_valid or
-            np.linalg.norm(v2) >= self.min_speed_for_valid*2):
-            return False
+        #if (np.linalg.norm(v3) >= self.min_speed_for_valid or
+        #    np.linalg.norm(v2) >= self.min_speed_for_valid*2):
+        #    return False
 
         return True
     

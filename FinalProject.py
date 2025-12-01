@@ -104,7 +104,7 @@ print("\nT (translation):\n", stereo['T'])
 print("\nBaseline (distance):", np.linalg.norm(stereo['T']), "m")
 
 
-seq_01_path = r"c:\Program Files\StartJupyter\PFAS\Final Project\Rectified Images\seq_01"
+seq_01_path = r"c:\Program Files\StartJupyter\PFAS\Final Project\Rectified Images\seq_03"
 left_imgs, right_imgs, labels = load_sequence(seq_01_path)
 
 print(f"Loaded {len(left_imgs)} left images, {len(right_imgs)} right images")
